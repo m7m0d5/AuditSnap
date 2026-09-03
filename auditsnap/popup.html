@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src https: http:; img-src 'self'; object-src 'none';" />
+<title>AuditSnap</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+
+    <!-- ===================== HEADER ===================== -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2L4 5v6c0 5.25 3.4 9.74 8 11 4.6-1.26 8-5.75 8-11V5l-8-3z" fill="#22d3ee"/>
+            <path d="M9.5 12.2l1.8 1.8 3.6-3.8" stroke="#0f172a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>AuditSnap</h1>
+          <span class="tagline">Client Security &amp; Attack Surface Checker</span>
+        </div>
+      </div>
+      <button id="rescanBtn" class="icon-btn" title="Re-run scan" aria-label="Re-run scan">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M4 4v6h6M20 20v-6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M5.5 15a8 8 0 0 0 14-4.5M18.5 9A8 8 0 0 0 4.5 13.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="target-row" id="targetRow">
+      <span class="dot" id="targetDot"></span>
+      <span id="targetDomain" class="target-domain">Detecting active tab&hellip;</span>
+    </div>
+
+    <!-- ===================== STATUS / ERROR BANNER ===================== -->
+    <div id="statusBanner" class="status-banner hidden"></div>
+
+    <!-- ===================== LOADING STATE ===================== -->
+    <div id="loadingState" class="loading-state">
+      <div class="spinner"></div>
+      <p>Running passive scan&hellip;</p>
+    </div>
+
+    <!-- ===================== MAIN CONTENT ===================== -->
+    <main id="mainContent" class="main-content hidden">
+
+      <!-- Score Meter -->
+      <section class="score-card">
+        <div class="score-ring-wrap">
+          <svg class="score-ring" width="96" height="96" viewBox="0 0 96 96">
+            <circle class="ring-track" cx="48" cy="48" r="42" />
+            <circle id="scoreRingFg" class="ring-fg" cx="48" cy="48" r="42" />
+          </svg>
+          <div class="score-number">
+            <span id="scoreValue">--</span>
+            <small>/100</small>
+          </div>
+        </div>
+        <div class="score-meta">
+          <span id="scoreLabel" class="score-label">Calculating&hellip;</span>
+          <span class="score-sub">Security Posture Score</span>
+        </div>
+      </section>
+
+      <!-- Tabs -->
+      <nav class="tabs" role="tablist" aria-label="Audit sections">
+        <button class="tab-btn active" data-tab="headers" role="tab" aria-selected="true">Headers</button>
+        <button class="tab-btn" data-tab="cookies" role="tab" aria-selected="false">Cookies</button>
+        <button class="tab-btn" data-tab="surface" role="tab" aria-selected="false">Exposed Paths</button>
+      </nav>
+
+      <!-- Panels -->
+      <section class="panels">
+
+        <!-- HEADERS PANEL -->
+        <div id="panel-headers" class="panel active" role="tabpanel">
+          <ul id="headersList" class="check-list"></ul>
+        </div>
+
+        <!-- COOKIES PANEL -->
+        <div id="panel-cookies" class="panel" role="tabpanel">
+          <div class="summary-strip">
+            <div class="summary-item">
+              <span id="cookieTotal" class="summary-num">0</span>
+              <span class="summary-label">Total Cookies</span>
+            </div>
+            <div class="summary-item risk">
+              <span id="cookieInsecure" class="summary-num">0</span>
+              <span class="summary-label">Insecure Cookies</span>
+            </div>
+          </div>
+          <ul id="cookiesList" class="check-list"></ul>
+        </div>
+
+        <!-- SURFACE PANEL -->
+        <div id="panel-surface" class="panel" role="tabpanel">
+          <div class="sub-block">
+            <h3>robots.txt</h3>
+            <div id="robotsStatus" class="sub-status">Checking&hellip;</div>
+            <ul id="robotsList" class="chip-list"></ul>
+          </div>
+          <div class="sub-block">
+            <h3>sitemap.xml</h3>
+            <div id="sitemapStatus" class="sub-status">Checking&hellip;</div>
+          </div>
+          <div class="sub-block">
+            <h3>Server Fingerprinting</h3>
+            <ul id="fingerprintList" class="check-list"></ul>
+          </div>
+        </div>
+
+      </section>
+    </main>
+
+    <!-- ===================== ACTION BAR ===================== -->
+    <footer class="action-bar">
+      <button id="copyHookBtn" class="btn btn-primary" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" fill="currentColor"/></svg>
+        Copy Proposal Hook
+      </button>
+      <button id="copyReportBtn" class="btn btn-secondary" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 2h9l5 5v15a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.6"/><path d="M9 12h6M9 16h6M9 8h2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        Copy Markdown Report
+      </button>
+    </footer>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

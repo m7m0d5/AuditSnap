@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "AuditSnap - Client Security & Attack Surface Checker",
+  "version": "1.0.0",
+  "description": "1-click passive security assessment for pentesters, security auditors, and freelancers. Scans HTTP security headers, cookie hygiene, and passive attack surface, then generates a client-ready proposal snippet.",
+  "permissions": [
+    "activeTab",
+    "cookies",
+    "webRequest",
+    "clipboardWrite",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AuditSnap - Security Audit"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
