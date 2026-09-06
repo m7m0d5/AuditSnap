@@ -7,15 +7,21 @@
  *      falling back to a live fetch if nothing is cached yet).
  *   3. Inspect cookies via chrome.cookies.getAll.
  *   4. Probe robots.txt / sitemap.xml / fingerprinting headers.
- *   5. Compute a 0-100 Security Posture Score.
- *   6. Render the UI (score ring, tabs/panels).
- *   7. Wire up "Copy Proposal Hook" and "Copy Markdown Report".
+ *   5. Probe sensitive file exposure (.env, .git/config, etc).
+ *   6. Probe security.txt (RFC 9116 - responsible disclosure).
+ *   7. Fingerprint technology stack from headers + cookies.
+ *   8. Inventory third-party scripts loaded on the page.
+ *   9. Compute a 0-100 Security Posture Score.
+ *  10. Render the UI (score ring, tabs/panels).
+ *  11. Wire up "Copy Proposal Hook" and "Copy Markdown Report".
  * ------------------------------------------------------------
  */
 
 'use strict';
 
+// ============================================================
 // CONSTANTS
+// ============================================================
 
 const FETCH_TIMEOUT_MS = 4000;
 
@@ -60,12 +66,79 @@ const SENSITIVE_PATH_KEYWORDS = [
 
 const FINGERPRINT_HEADERS = ['server', 'x-powered-by', 'x-aspnet-version', 'x-generator'];
 
-// Score weight buckets (headers 65%, cookies 20%, surface 15%)
-const COOKIE_PENALTY_PER_INSECURE = 4; // capped below
-const COOKIE_PENALTY_CAP = 20;
-const SURFACE_PENALTY_CAP = 15;
+// High-value, low-noise sensitive file candidates. Kept short on purpose:
+// each additional path is another network round trip from the popup.
+const SENSITIVE_FILE_PATHS = [
+  '/.env',
+  '/.git/config',
+  '/.git/HEAD',
+  '/wp-config.php.bak',
+  '/config.php.bak',
+  '/.DS_Store',
+  '/backup.zip',
+  '/database.sql',
+];
 
+// Passive technology fingerprint signatures. Each `test` runs against
+// already-collected headers/cookies - no extra network calls needed.
+const TECH_SIGNATURES = [
+  { label: 'Shopify', test: (h, c) => /shopify/i.test(h.server || '') || c.some((ck) => /^_shopify|^shopify_/i.test(ck.name)) },
+  { label: 'WordPress', test: (h, c) => c.some((ck) => /^wordpress_|wp-settings/i.test(ck.name)) || /wordpress/i.test(h['x-generator'] || '') },
+  { label: 'PHP', test: (h, c) => c.some((ck) => /^PHPSESSID$/i.test(ck.name)) || /php/i.test(h['x-powered-by'] || '') },
+  { label: 'Java (JSESSIONID)', test: (h, c) => c.some((ck) => /^JSESSIONID$/i.test(ck.name)) },
+  { label: 'Laravel', test: (h, c) => c.some((ck) => /laravel_session/i.test(ck.name)) },
+  { label: 'CodeIgniter', test: (h, c) => c.some((ck) => /^ci_session/i.test(ck.name)) },
+  { label: 'ASP.NET', test: (h, c) => c.some((ck) => /^ASP\.NET_SessionId$/i.test(ck.name)) || /asp\.net/i.test(h['x-powered-by'] || '') || !!h['x-aspnet-version'] },
+  { label: 'Cloudflare', test: (h, c) => c.some((ck) => /^__cfduid$|^cf_clearance$/i.test(ck.name)) || /cloudflare/i.test(h.server || '') },
+  { label: 'Microsoft Azure', test: (h, c) => c.some((ck) => /^ARRAffinity/i.test(ck.name)) },
+  { label: 'AWS Application Load Balancer', test: (h, c) => c.some((ck) => /^AWSALB/i.test(ck.name)) },
+  { label: 'Vercel', test: (h) => /vercel/i.test(h.server || '') || !!h['x-vercel-id'] },
+  { label: 'Netlify', test: (h) => /netlify/i.test(h.server || '') },
+  { label: 'GitHub Pages', test: (h) => /github\.com/i.test(h.server || '') },
+  { label: 'Nginx', test: (h) => /nginx/i.test(h.server || '') },
+  { label: 'Apache', test: (h) => /apache/i.test(h.server || '') },
+  { label: 'Express.js', test: (h) => /express/i.test(h['x-powered-by'] || '') },
+];
+
+// Known third-party script hosts, mapped to a human-friendly label.
+// Anything not in this map is still listed, just without a category.
+const KNOWN_SCRIPT_DOMAINS = {
+  'google-analytics.com': 'Google Analytics',
+  'www.google-analytics.com': 'Google Analytics',
+  'googletagmanager.com': 'Google Tag Manager',
+  'www.googletagmanager.com': 'Google Tag Manager',
+  'doubleclick.net': 'Google Ads (DoubleClick)',
+  'connect.facebook.net': 'Meta Pixel',
+  'facebook.net': 'Meta Pixel',
+  'hotjar.com': 'Hotjar',
+  'static.hotjar.com': 'Hotjar',
+  'segment.com': 'Segment',
+  'cdn.segment.com': 'Segment',
+  'intercom.io': 'Intercom',
+  'widget.intercom.io': 'Intercom',
+  'sentry.io': 'Sentry (Error Tracking)',
+  'js.stripe.com': 'Stripe',
+  'cloudflareinsights.com': 'Cloudflare Analytics',
+  'clarity.ms': 'Microsoft Clarity',
+  'analytics.tiktok.com': 'TikTok Pixel',
+  'cdn.jsdelivr.net': 'jsDelivr CDN',
+  'cdnjs.cloudflare.com': 'cdnjs CDN',
+  'ajax.googleapis.com': 'Google Hosted Libraries',
+};
+
+// Score weight buckets - rebalanced to make room for sensitive-file
+// exposure inside the "surface" bucket (Headers 60% / Cookies 20% / Surface 20%).
+const HEADER_MAX_POINTS = 60;
+const COOKIE_MAX_POINTS = 20;
+const SURFACE_MAX_POINTS = 20;
+const COOKIE_PENALTY_PER_INSECURE = 4;
+const COOKIE_PENALTY_CAP = COOKIE_MAX_POINTS;
+const SURFACE_PENALTY_CAP = SURFACE_MAX_POINTS;
+const SENSITIVE_FILE_PENALTY_EACH = 6; // exposed source/config files are severe
+
+// ============================================================
 // STATE
+// ============================================================
 
 const state = {
   tab: null,
@@ -77,12 +150,18 @@ const state = {
   robots: { checked: false, accessible: false, sensitivePaths: [], error: null },
   sitemap: { checked: false, accessible: false, error: null },
   fingerprint: [],
+  sensitiveFiles: { checked: false, exposed: [], error: null },
+  securityTxt: { checked: false, accessible: false, path: null, contact: null },
+  techStack: [],
+  thirdPartyScripts: { checked: false, list: [], error: null },
   score: 0,
   headerResults: [],
   isRestrictedPage: false,
 };
 
+// ============================================================
 // DOM REFERENCES
+// ============================================================
 
 const el = {
   targetDomain: document.getElementById('targetDomain'),
@@ -106,6 +185,14 @@ const el = {
   robotsList: document.getElementById('robotsList'),
   sitemapStatus: document.getElementById('sitemapStatus'),
   fingerprintList: document.getElementById('fingerprintList'),
+  sensitiveFilesStatus: document.getElementById('sensitiveFilesStatus'),
+  sensitiveFilesList: document.getElementById('sensitiveFilesList'),
+  securityTxtStatus: document.getElementById('securityTxtStatus'),
+
+  techStatus: document.getElementById('techStatus'),
+  techList: document.getElementById('techList'),
+  thirdPartyStatus: document.getElementById('thirdPartyStatus'),
+  thirdPartyList: document.getElementById('thirdPartyList'),
 
   copyHookBtn: document.getElementById('copyHookBtn'),
   copyReportBtn: document.getElementById('copyReportBtn'),
@@ -116,10 +203,13 @@ const el = {
     headers: document.getElementById('panel-headers'),
     cookies: document.getElementById('panel-cookies'),
     surface: document.getElementById('panel-surface'),
+    tech: document.getElementById('panel-tech'),
   },
 };
 
+// ============================================================
 // UTILITIES
+// ============================================================
 
 function escapeHtml(str) {
   if (typeof str !== 'string') return '';
@@ -173,7 +263,9 @@ function showToast(message) {
   }, 2200);
 }
 
+// ============================================================
 // STEP 1: ACTIVE TAB RESOLUTION
+// ============================================================
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -183,7 +275,9 @@ async function getActiveTab() {
   return tabs[0];
 }
 
+// ============================================================
 // STEP 2: HEADER RETRIEVAL (cache first, then live fetch fallback)
+// ============================================================
 
 async function getCachedHeaders(tabId) {
   return new Promise((resolve) => {
@@ -256,7 +350,9 @@ async function resolveHeaders(tab) {
   }
 }
 
+// ============================================================
 // STEP 3: COOKIE INSPECTION
+// ============================================================
 
 async function inspectCookies(tab) {
   try {
@@ -283,7 +379,9 @@ async function inspectCookies(tab) {
   }
 }
 
+// ============================================================
 // STEP 4: PASSIVE ATTACK SURFACE (robots.txt / sitemap.xml / fingerprint headers)
+// ============================================================
 
 async function fetchTextWithTimeout(url) {
   const controller = new AbortController();
@@ -292,6 +390,7 @@ async function fetchTextWithTimeout(url) {
     const res = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
+      credentials: 'omit',
       signal: controller.signal,
       cache: 'no-store',
     });
@@ -367,7 +466,150 @@ async function scanAttackSurface(origin) {
     .map((h) => ({ name: h, value: state.headers[h] }));
 }
 
-// STEP 5: SCORING
+// ============================================================
+// STEP 5: SENSITIVE FILE EXPOSURE
+// ============================================================
+
+async function checkPathExposed(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      credentials: 'omit',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    // Heuristic to cut false positives: SPA/CMS catch-all routes usually
+    // return a 200 HTML page for *any* path. A real exposed .env/.git
+    // file is essentially never served with a text/html content-type.
+    const looksLikeHtmlFallback = contentType.includes('text/html');
+    const exposed = res.status === 200 && !looksLikeHtmlFallback;
+    return { exposed, status: res.status, contentType };
+  } catch (err) {
+    return { exposed: false, status: null, error: err && err.name === 'AbortError' ? 'timeout' : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function scanSensitiveFiles(origin) {
+  try {
+    const results = await Promise.allSettled(
+      SENSITIVE_FILE_PATHS.map((p) => checkPathExposed(`${origin}${p}`))
+    );
+    const exposed = [];
+    results.forEach((r, idx) => {
+      if (r.status === 'fulfilled' && r.value && r.value.exposed) {
+        exposed.push({ path: SENSITIVE_FILE_PATHS[idx], status: r.value.status });
+      }
+    });
+    state.sensitiveFiles = { checked: true, exposed, error: null };
+  } catch (err) {
+    state.sensitiveFiles = { checked: true, exposed: [], error: String(err) };
+  }
+}
+
+// ============================================================
+// STEP 6: security.txt (RFC 9116 - responsible disclosure contact)
+// ============================================================
+
+async function scanSecurityTxt(origin) {
+  try {
+    let result = await fetchTextWithTimeout(`${origin}/.well-known/security.txt`);
+    let path = '/.well-known/security.txt';
+
+    if (!result.accessible) {
+      const legacy = await fetchTextWithTimeout(`${origin}/security.txt`);
+      if (legacy.accessible) {
+        result = legacy;
+        path = '/security.txt';
+      }
+    }
+
+    if (result.accessible) {
+      const match = (result.text || '').match(/^Contact:\s*(.+)$/im);
+      state.securityTxt = {
+        checked: true,
+        accessible: true,
+        path,
+        contact: match ? match[1].trim() : null,
+      };
+    } else {
+      state.securityTxt = { checked: true, accessible: false, path: null, contact: null };
+    }
+  } catch (err) {
+    state.securityTxt = { checked: true, accessible: false, path: null, contact: null, error: String(err) };
+  }
+}
+
+// ============================================================
+// STEP 7: TECHNOLOGY FINGERPRINT (no extra network calls)
+// ============================================================
+
+function detectTechnologies(headers, cookies) {
+  const found = [];
+  for (const sig of TECH_SIGNATURES) {
+    try {
+      if (sig.test(headers || {}, cookies || [])) found.push(sig.label);
+    } catch (e) {
+      // A single bad signature test should never break fingerprinting.
+    }
+  }
+  return Array.from(new Set(found));
+}
+
+// ============================================================
+// STEP 8: THIRD-PARTY SCRIPT INVENTORY (content-script injection)
+// ============================================================
+
+function labelForScriptDomain(domain) {
+  if (KNOWN_SCRIPT_DOMAINS[domain]) return KNOWN_SCRIPT_DOMAINS[domain];
+  const match = Object.keys(KNOWN_SCRIPT_DOMAINS).find((key) => domain.endsWith(key));
+  return match ? KNOWN_SCRIPT_DOMAINS[match] : null;
+}
+
+async function scanThirdPartyScripts(tab) {
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        try {
+          const pageHost = location.hostname;
+          const scripts = Array.from(document.scripts || []);
+          const hostCounts = {};
+          scripts.forEach((s) => {
+            if (!s.src) return;
+            try {
+              const u = new URL(s.src, location.href);
+              if (u.hostname && u.hostname !== pageHost) {
+                hostCounts[u.hostname] = (hostCounts[u.hostname] || 0) + 1;
+              }
+            } catch (e) {
+              // Ignore unparsable script src values.
+            }
+          });
+          return Object.entries(hostCounts).map(([domain, count]) => ({ domain, count }));
+        } catch (e) {
+          return [];
+        }
+      },
+    });
+
+    const result = injectionResults && injectionResults[0] ? injectionResults[0].result : [];
+    state.thirdPartyScripts = { checked: true, list: Array.isArray(result) ? result : [], error: null };
+  } catch (err) {
+    // Injection can fail on special pages (Web Store, PDF viewer, etc.)
+    // even when the URL doesn't match our isRestrictedUrl() guard.
+    state.thirdPartyScripts = { checked: true, list: [], error: String(err && err.message ? err.message : err) };
+  }
+}
+
+// ============================================================
+// STEP 9: SCORING
+// ============================================================
 
 function computeHeaderResults() {
   state.headerResults = SECURITY_HEADERS.map((def) => {
@@ -382,27 +624,27 @@ function computeHeaderResults() {
 }
 
 function computeScore() {
-  // Headers: sum weights of present headers (weights already total 80)
+  // Headers: sum weights of present headers (weights already total 80),
+  // normalized into the HEADER_MAX_POINTS bucket.
   const headerMaxTotal = SECURITY_HEADERS.reduce((sum, h) => sum + h.weight, 0); // 80
   const headerEarned = state.headerResults.reduce((sum, h) => sum + (h.present ? h.weight : 0), 0);
+  const headersScore = headerMaxTotal > 0 ? (headerEarned / headerMaxTotal) * HEADER_MAX_POINTS : 0;
 
-  // Normalize headers portion to 65 points max
-  const headersScore = headerMaxTotal > 0 ? (headerEarned / headerMaxTotal) * 65 : 0;
-
-  // Cookies: start at 20, subtract penalty per insecure cookie (capped)
+  // Cookies: start full, subtract penalty per insecure cookie (capped).
   const cookiePenalty = Math.min(
     state.cookieSummary.insecure * COOKIE_PENALTY_PER_INSECURE,
     COOKIE_PENALTY_CAP
   );
-  const cookiesScore = Math.max(0, 20 - cookiePenalty);
+  const cookiesScore = Math.max(0, COOKIE_MAX_POINTS - cookiePenalty);
 
-  // Surface: start at 15, subtract for each disclosed sensitive path
-  // and for each fingerprinting header exposed.
-  const surfacePenalty = Math.min(
-    state.robots.sensitivePaths.length * 2 + state.fingerprint.length * 2,
-    SURFACE_PENALTY_CAP
-  );
-  const surfaceScore = Math.max(0, 15 - surfacePenalty);
+  // Surface: disclosed sensitive robots.txt paths + fingerprinting headers
+  // + exposed sensitive files (weighted heavier - these are severe findings).
+  const surfacePenaltyRaw =
+    state.robots.sensitivePaths.length * 2 +
+    state.fingerprint.length * 2 +
+    state.sensitiveFiles.exposed.length * SENSITIVE_FILE_PENALTY_EACH;
+  const surfacePenalty = Math.min(surfacePenaltyRaw, SURFACE_PENALTY_CAP);
+  const surfaceScore = Math.max(0, SURFACE_MAX_POINTS - surfacePenalty);
 
   const total = Math.round(headersScore + cookiesScore + surfaceScore);
   state.score = Math.min(100, Math.max(0, total));
@@ -415,7 +657,9 @@ function scoreLabelFor(score) {
   return { text: 'High Risk', color: 'var(--accent-crimson)' };
 }
 
+// ============================================================
 // RENDERING
+// ============================================================
 
 function renderTargetRow() {
   try {
@@ -568,6 +812,80 @@ function renderSurface() {
       el.fingerprintList.appendChild(li);
     });
   }
+
+  // sensitive files
+  if (!state.sensitiveFiles.checked) {
+    el.sensitiveFilesStatus.textContent = 'Checking…';
+  } else if (state.sensitiveFiles.exposed.length === 0) {
+    el.sensitiveFilesStatus.textContent = 'No exposed source/config files detected among common paths.';
+  } else {
+    el.sensitiveFilesStatus.textContent = `⚠ ${state.sensitiveFiles.exposed.length} sensitive file(s) publicly accessible:`;
+  }
+  el.sensitiveFilesList.innerHTML = '';
+  state.sensitiveFiles.exposed.forEach((f) => {
+    const li = document.createElement('li');
+    li.className = 'chip';
+    li.textContent = `${f.path} (HTTP ${f.status})`;
+    el.sensitiveFilesList.appendChild(li);
+  });
+
+  // security.txt
+  if (!state.securityTxt.checked) {
+    el.securityTxtStatus.textContent = 'Checking…';
+  } else if (state.securityTxt.accessible) {
+    el.securityTxtStatus.textContent = state.securityTxt.contact
+      ? `Present at ${state.securityTxt.path} — contact: ${state.securityTxt.contact}`
+      : `Present at ${state.securityTxt.path}, but no Contact: line found.`;
+  } else {
+    el.securityTxtStatus.textContent = 'Not found — this organization has no published responsible disclosure contact.';
+  }
+}
+
+function renderTechStack() {
+  // Detected technologies
+  el.techList.innerHTML = '';
+  if (!state.techStack.length) {
+    el.techStatus.textContent = 'No recognizable technology signatures found in headers or cookies.';
+  } else {
+    el.techStatus.textContent = `${state.techStack.length} technology signature(s) detected:`;
+    state.techStack.forEach((label) => {
+      const li = document.createElement('li');
+      li.className = 'chip tech';
+      li.textContent = label;
+      el.techList.appendChild(li);
+    });
+  }
+
+  // Third-party scripts
+  el.thirdPartyList.innerHTML = '';
+  if (!state.thirdPartyScripts.checked) {
+    el.thirdPartyStatus.textContent = 'Scanning page…';
+    return;
+  }
+  if (state.thirdPartyScripts.error) {
+    el.thirdPartyStatus.textContent = 'Could not inspect scripts on this page (restricted context).';
+    return;
+  }
+  const list = state.thirdPartyScripts.list;
+  if (!list.length) {
+    el.thirdPartyStatus.textContent = 'No external script hosts detected on this page.';
+    return;
+  }
+  el.thirdPartyStatus.textContent = `${list.length} external script host(s) loaded on this page:`;
+  const sorted = [...list].sort((a, b) => b.count - a.count);
+  sorted.forEach((entry) => {
+    const label = labelForScriptDomain(entry.domain);
+    const li = document.createElement('li');
+    li.className = 'check-item ' + (label ? 'warn' : '');
+    li.innerHTML = `
+      <div class="check-item-top">
+        <span class="check-name">${escapeHtml(entry.domain)}</span>
+        <span class="badge ${label ? 'warn' : 'pass'}">${label ? escapeHtml(label) : 'Unknown'}</span>
+      </div>
+      <div class="check-value">${entry.count} script tag(s)</div>
+    `;
+    el.thirdPartyList.appendChild(li);
+  });
 }
 
 function renderAll() {
@@ -576,9 +894,12 @@ function renderAll() {
   renderHeaders();
   renderCookies();
   renderSurface();
+  renderTechStack();
 }
 
+// ============================================================
 // TABS
+// ============================================================
 
 function setupTabs() {
   el.tabBtns.forEach((btn) => {
@@ -597,7 +918,9 @@ function setupTabs() {
   });
 }
 
+// ============================================================
 // EXPORT GENERATORS
+// ============================================================
 
 function getFailedHeaderLabels() {
   return state.headerResults.filter((h) => !h.present).map((h) => h.label);
@@ -620,8 +943,14 @@ function buildProposalHook() {
   if (state.robots.sensitivePaths.length > 0) {
     issues.push(`${state.robots.sensitivePaths.length} sensitive endpoint(s) disclosed via robots.txt`);
   }
+  if (state.sensitiveFiles.exposed.length > 0) {
+    issues.push(`${state.sensitiveFiles.exposed.length} sensitive source/config file(s) publicly accessible (${state.sensitiveFiles.exposed.map((f) => f.path).join(', ')})`);
+  }
   if (state.fingerprint.length > 0) {
     issues.push(`server fingerprinting headers exposing backend technology`);
+  }
+  if (!state.securityTxt.accessible) {
+    issues.push(`no published security.txt / responsible disclosure contact`);
   }
 
   const issuesText = issues.length
@@ -700,17 +1029,49 @@ function buildMarkdownReport() {
     lines.push(`**Server fingerprinting headers exposed:** None detected.`);
   }
   lines.push(``);
+  lines.push(`**Sensitive file exposure:** ${state.sensitiveFiles.exposed.length ? `⚠ ${state.sensitiveFiles.exposed.length} file(s) publicly accessible` : 'None detected among common paths checked'}`);
+  if (state.sensitiveFiles.exposed.length) {
+    state.sensitiveFiles.exposed.forEach((f) => lines.push(`- \`${f.path}\` (HTTP ${f.status})`));
+  }
+  lines.push(``);
+  lines.push(`**security.txt (RFC 9116):** ${state.securityTxt.accessible ? `Present at \`${state.securityTxt.path}\`${state.securityTxt.contact ? ` — Contact: ${state.securityTxt.contact}` : ''}` : 'Not published'}`);
+  lines.push(``);
+
+  lines.push(`## 4. Technology Fingerprint`);
+  lines.push(``);
+  if (state.techStack.length) {
+    state.techStack.forEach((t) => lines.push(`- ${t}`));
+  } else {
+    lines.push(`No recognizable technology signatures found in headers or cookies.`);
+  }
+  lines.push(``);
+
+  lines.push(`## 5. Third-Party Script Inventory`);
+  lines.push(``);
+  if (state.thirdPartyScripts.list && state.thirdPartyScripts.list.length) {
+    lines.push(`| Domain | Script Tags | Category |`);
+    lines.push(`|---|---|---|`);
+    state.thirdPartyScripts.list.forEach((entry) => {
+      const label = labelForScriptDomain(entry.domain) || 'Unknown';
+      lines.push(`| ${entry.domain} | ${entry.count} | ${label} |`);
+    });
+  } else {
+    lines.push(`No external script hosts detected on this page.`);
+  }
+  lines.push(``);
 
   lines.push(`## Summary`);
   lines.push(``);
-  lines.push(`This passive scan surfaced ${getFailedHeaderLabels().length} missing security header(s), ${state.cookieSummary.insecure} insecure cookie(s), and ${state.robots.sensitivePaths.length} disclosed sensitive path(s), resulting in an overall Security Posture Score of **${state.score}/100**.`);
+  lines.push(`This passive scan surfaced ${getFailedHeaderLabels().length} missing security header(s), ${state.cookieSummary.insecure} insecure cookie(s), ${state.robots.sensitivePaths.length} disclosed sensitive path(s), and ${state.sensitiveFiles.exposed.length} exposed sensitive file(s), resulting in an overall Security Posture Score of **${state.score}/100**.`);
   lines.push(``);
   lines.push(`_Generated with AuditSnap._`);
 
   return lines.join('\n');
 }
 
+// ============================================================
 // CLIPBOARD
+// ============================================================
 
 async function copyToClipboard(text, successMessage) {
   try {
@@ -740,7 +1101,9 @@ async function copyToClipboard(text, successMessage) {
   }
 }
 
+// ============================================================
 // MAIN ORCHESTRATION
+// ============================================================
 
 function setLoading(isLoading) {
   el.loadingState.classList.toggle('hidden', !isLoading);
@@ -783,14 +1146,22 @@ async function runAudit() {
     }
     state.origin = originUrl;
 
-    // Run the three passive checks. Each has its own internal error
-    // handling so one failing module never blocks the others.
+    // Headers and cookies first - later modules (fingerprinting, scoring)
+    // depend on their results.
     await resolveHeaders(tab);
     computeHeaderResults();
-
     await inspectCookies(tab);
 
-    await scanAttackSurface(originUrl);
+    // Run the remaining passive checks concurrently - each has its own
+    // internal error handling so one failing module never blocks another.
+    await Promise.all([
+      scanAttackSurface(originUrl),
+      scanSensitiveFiles(originUrl),
+      scanSecurityTxt(originUrl),
+      scanThirdPartyScripts(tab),
+    ]);
+
+    state.techStack = detectTechnologies(state.headers, state.cookies);
 
     computeScore();
     renderAll();
@@ -812,7 +1183,9 @@ async function runAudit() {
   }
 }
 
+// ============================================================
 // EVENT WIRING
+// ============================================================
 
 function wireEvents() {
   el.rescanBtn.addEventListener('click', () => {
@@ -832,7 +1205,9 @@ function wireEvents() {
   });
 }
 
+// ============================================================
 // INIT
+// ============================================================
 
 document.addEventListener('DOMContentLoaded', () => {
   setupTabs();

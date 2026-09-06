@@ -1,5 +1,6 @@
 /**
  * AuditSnap - background.js (Service Worker)
+ * ------------------------------------------------------------
  * Responsibilities:
  *  1. Listen for the top-level (main_frame) navigation response headers
  *     for every tab using chrome.webRequest.onHeadersReceived.
@@ -10,6 +11,7 @@
  *  3. Clean up cached data when a tab navigates away or is closed, to
  *     avoid unbounded memory growth and stale data leaking into a new
  *     page's audit.
+ * ------------------------------------------------------------
  */
 
 'use strict';
@@ -43,9 +45,11 @@ function normalizeHeaders(headersArray) {
   return result;
 }
 
+// --------------------------------------------------------------
 // Capture headers for the main frame of every navigation.
 // extraHeaders is required in MV3 for some headers (like CSP/HSTS
 // in certain Chrome versions) to be visible to the extension.
+// --------------------------------------------------------------
 try {
   chrome.webRequest.onHeadersReceived.addListener(
     (details) => {
@@ -74,9 +78,11 @@ try {
   console.error('[AuditSnap] Could not register webRequest listener:', setupErr);
 }
 
+// --------------------------------------------------------------
 // Clear stale cache entries when a tab is about to navigate to a
 // brand-new document, so popup.js never reads headers belonging
 // to the previous page loaded in that tab.
+// --------------------------------------------------------------
 try {
   chrome.webNavigation && chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     if (details.frameId === 0 && tabHeaderCache.has(details.tabId)) {
@@ -89,12 +95,16 @@ try {
   // header capture still works via onHeadersReceived alone.
 }
 
+// --------------------------------------------------------------
 // Cleanup when a tab is closed to prevent unbounded memory growth.
+// --------------------------------------------------------------
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabHeaderCache.delete(tabId);
 });
 
+// --------------------------------------------------------------
 // Message bridge: popup.js requests cached headers for the active tab.
+// --------------------------------------------------------------
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== 'AUDITSNAP_GET_HEADERS') {
     return false; // not our message
