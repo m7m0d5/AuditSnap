@@ -9,6 +9,7 @@
 <body>
   <div class="app">
 
+    <!-- ===================== HEADER ===================== -->
     <header class="app-header">
       <div class="brand">
         <div class="brand-mark">
@@ -69,7 +70,9 @@
       <nav class="tabs" role="tablist" aria-label="Audit sections">
         <button class="tab-btn active" data-tab="headers" role="tab" aria-selected="true">Headers</button>
         <button class="tab-btn" data-tab="cookies" role="tab" aria-selected="false">Cookies</button>
-        <button class="tab-btn" data-tab="surface" role="tab" aria-selected="false">Exposed Paths</button>
+        <button class="tab-btn" data-tab="surface" role="tab" aria-selected="false">Surface</button>
+        <button class="tab-btn" data-tab="tech" role="tab" aria-selected="false">Tech Stack</button>
+        <button class="tab-btn" data-tab="network" role="tab" aria-selected="false">Network</button>
       </nav>
 
       <!-- Panels -->
@@ -109,6 +112,51 @@
           <div class="sub-block">
             <h3>Server Fingerprinting</h3>
             <ul id="fingerprintList" class="check-list"></ul>
+          </div>
+          <div class="sub-block">
+            <h3>Sensitive File Exposure</h3>
+            <div id="sensitiveFilesStatus" class="sub-status">Checking&hellip;</div>
+            <ul id="sensitiveFilesList" class="chip-list"></ul>
+          </div>
+          <div class="sub-block">
+            <h3>security.txt (RFC 9116)</h3>
+            <div id="securityTxtStatus" class="sub-status">Checking&hellip;</div>
+          </div>
+        </div>
+
+        <!-- TECH STACK PANEL -->
+        <div id="panel-tech" class="panel" role="tabpanel">
+          <div class="sub-block">
+            <h3>Detected Technologies</h3>
+            <div id="techStatus" class="sub-status">Analyzing&hellip;</div>
+            <ul id="techList" class="chip-list"></ul>
+          </div>
+          <div class="sub-block">
+            <h3>Third-Party Scripts</h3>
+            <div id="thirdPartyStatus" class="sub-status">Scanning page&hellip;</div>
+            <ul id="thirdPartyList" class="check-list"></ul>
+          </div>
+        </div>
+
+        <!-- NETWORK PANEL -->
+        <div id="panel-network" class="panel" role="tabpanel">
+          <div class="sub-block">
+            <h3>HTTPS Enforcement</h3>
+            <div id="httpsEnforcementStatus" class="sub-status">Checking&hellip;</div>
+          </div>
+          <div class="sub-block">
+            <h3>HTTP Protocol</h3>
+            <div id="protocolStatus" class="sub-status">Checking&hellip;</div>
+          </div>
+          <div class="sub-block">
+            <h3>Mixed Content</h3>
+            <div id="mixedContentStatus" class="sub-status">Checking&hellip;</div>
+            <ul id="mixedContentList" class="chip-list"></ul>
+          </div>
+          <div class="sub-block">
+            <h3>Email Security (SPF / DMARC)</h3>
+            <div id="emailSecurityStatus" class="sub-status">Checking&hellip;</div>
+            <ul id="emailSecurityList" class="check-list"></ul>
           </div>
         </div>
 

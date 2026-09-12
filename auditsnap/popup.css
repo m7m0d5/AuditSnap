@@ -1,7 +1,7 @@
-/* ==========================================================
+/* 
    AuditSnap - popup.css
    Modern dark "cybersecurity" theme
-   ========================================================== */
+  */
 
 :root {
   --bg-base: #0f172a;      /* slate-900 */
@@ -52,14 +52,14 @@ html, body {
   position: relative;
 }
 
-/* ---------------- Scrollbars ---------------- */
+/*  Scrollbars  */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-soft); border-radius: 4px; }
 
-/* ==========================================================
+/* 
    HEADER
-   ========================================================== */
+   */
 .app-header {
   display: flex;
   align-items: center;
@@ -123,7 +123,7 @@ html, body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---------------- Target row ---------------- */
+/*  Target row  */
 .target-row {
   display: flex;
   align-items: center;
@@ -153,9 +153,9 @@ html, body {
   white-space: nowrap;
 }
 
-/* ==========================================================
+/* 
    STATUS BANNER (errors / restricted pages)
-   ========================================================== */
+    */
 .status-banner {
   margin: 12px 16px 0;
   padding: 10px 12px;
@@ -173,9 +173,9 @@ html, body {
 }
 .hidden { display: none !important; }
 
-/* ==========================================================
+/* 
    LOADING STATE
-   ========================================================== */
+   */
 .loading-state {
   flex: 1;
   display: flex;
@@ -195,16 +195,16 @@ html, body {
   animation: spin 0.8s linear infinite;
 }
 
-/* ==========================================================
+/* 
    MAIN CONTENT
-   ========================================================== */
+   */
 .main-content {
   display: flex;
   flex-direction: column;
   flex: 1;
 }
 
-/* ---------------- Score card ---------------- */
+/*  Score card  */
 .score-card {
   display: flex;
   align-items: center;
@@ -275,7 +275,7 @@ html, body {
   color: var(--text-muted);
 }
 
-/* ---------------- Tabs ---------------- */
+/*  Tabs  */
 .tabs {
   display: flex;
   border-bottom: 1px solid var(--border);
@@ -304,7 +304,7 @@ html, body {
   border-bottom-color: var(--accent-cyan);
 }
 
-/* ---------------- Panels ---------------- */
+/*  Panels  */
 .panels {
   flex: 1;
   overflow-y: auto;
@@ -317,7 +317,7 @@ html, body {
 }
 .panel.active { display: block; }
 
-/* ---------------- Check list (headers / cookies / fingerprint) ---------------- */
+/*  Check list (headers / cookies / fingerprint)  */
 .check-list {
   list-style: none;
   margin: 0;
@@ -378,7 +378,7 @@ html, body {
   word-break: break-all;
 }
 
-/* ---------------- Cookie summary strip ---------------- */
+/* Cookie summary strip  */
 .summary-strip {
   display: flex;
   gap: 10px;
@@ -407,7 +407,7 @@ html, body {
   letter-spacing: 0.3px;
 }
 
-/* ---------------- Surface panel ---------------- */
+/*  Surface panel  */
 .sub-block { margin-bottom: 16px; }
 .sub-block h3 {
   font-size: 11.5px;
@@ -455,9 +455,7 @@ html, body {
   color: #a5f3fc;
 }
 
-/* ==========================================================
-   ACTION BAR
-   ========================================================== */
+/* ACTION BAR*/
 .action-bar {
   display: flex;
   gap: 8px;
@@ -498,9 +496,7 @@ html, body {
   color: var(--accent-cyan);
 }
 
-/* ==========================================================
-   TOAST
-   ========================================================== */
+/* TOAST */
 .toast {
   position: absolute;
   bottom: 68px;
