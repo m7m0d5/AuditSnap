@@ -10,10 +10,17 @@
  *   5. Probe sensitive file exposure (.env, .git/config, etc).
  *   6. Probe security.txt (RFC 9116 - responsible disclosure).
  *   7. Fingerprint technology stack from headers + cookies.
- *   8. Inventory third-party scripts loaded on the page.
- *   9. Compute a 0-100 Security Posture Score.
- *  10. Render the UI (score ring, tabs/panels).
- *  11. Wire up "Copy Proposal Hook" and "Copy Markdown Report".
+ *   8. Inspect page runtime: third-party scripts, negotiated HTTP
+ *      protocol (h2/h3), and mixed-content resources.
+ *   9. Check HTTPS enforcement (does the plain-http origin
+ *      redirect to https?).
+ *  10. Check email security posture (SPF / DMARC DNS records)
+ *      via a public DNS-over-HTTPS resolver.
+ *  11. Compute a 0-100 Security Posture Score.
+ *  12. Render the UI (score ring, tabs/panels) - every render
+ *      step is null-safe so a mismatched/stale popup.html can
+ *      never crash the whole scan, just log a console warning.
+ *  13. Wire up "Copy Proposal Hook" and "Copy Markdown Report".
  * ------------------------------------------------------------
  */
 
@@ -24,6 +31,7 @@
 // ============================================================
 
 const FETCH_TIMEOUT_MS = 4000;
+const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
 
 const SECURITY_HEADERS = [
   {
@@ -126,15 +134,19 @@ const KNOWN_SCRIPT_DOMAINS = {
   'ajax.googleapis.com': 'Google Hosted Libraries',
 };
 
-// Score weight buckets - rebalanced to make room for sensitive-file
-// exposure inside the "surface" bucket (Headers 60% / Cookies 20% / Surface 20%).
-const HEADER_MAX_POINTS = 60;
+// Score weight buckets. Headers 55% / Cookies 20% / Surface 25%.
+// "Surface" now absorbs network-level passive findings too (HTTPS
+// enforcement, mixed content) alongside disclosure findings, since
+// they're all observable without any active exploitation.
+const HEADER_MAX_POINTS = 55;
 const COOKIE_MAX_POINTS = 20;
-const SURFACE_MAX_POINTS = 20;
+const SURFACE_MAX_POINTS = 25;
 const COOKIE_PENALTY_PER_INSECURE = 4;
 const COOKIE_PENALTY_CAP = COOKIE_MAX_POINTS;
 const SURFACE_PENALTY_CAP = SURFACE_MAX_POINTS;
 const SENSITIVE_FILE_PENALTY_EACH = 6; // exposed source/config files are severe
+const HTTPS_NOT_ENFORCED_PENALTY = 8;
+const MIXED_CONTENT_PENALTY = 6;
 
 // ============================================================
 // STATE
@@ -154,6 +166,10 @@ const state = {
   securityTxt: { checked: false, accessible: false, path: null, contact: null },
   techStack: [],
   thirdPartyScripts: { checked: false, list: [], error: null },
+  httpsEnforcement: { checked: false, enforced: null, finalUrl: null, error: null },
+  protocolInfo: { checked: false, protocol: null },
+  mixedContent: { checked: false, resources: [] },
+  emailSecurity: { checked: false, domain: null, spf: null, dmarc: null, error: null },
   score: 0,
   headerResults: [],
   isRestrictedPage: false,
@@ -194,6 +210,13 @@ const el = {
   thirdPartyStatus: document.getElementById('thirdPartyStatus'),
   thirdPartyList: document.getElementById('thirdPartyList'),
 
+  httpsEnforcementStatus: document.getElementById('httpsEnforcementStatus'),
+  protocolStatus: document.getElementById('protocolStatus'),
+  mixedContentStatus: document.getElementById('mixedContentStatus'),
+  mixedContentList: document.getElementById('mixedContentList'),
+  emailSecurityStatus: document.getElementById('emailSecurityStatus'),
+  emailSecurityList: document.getElementById('emailSecurityList'),
+
   copyHookBtn: document.getElementById('copyHookBtn'),
   copyReportBtn: document.getElementById('copyReportBtn'),
   toast: document.getElementById('toast'),
@@ -204,6 +227,7 @@ const el = {
     cookies: document.getElementById('panel-cookies'),
     surface: document.getElementById('panel-surface'),
     tech: document.getElementById('panel-tech'),
+    network: document.getElementById('panel-network'),
   },
 };
 
@@ -227,6 +251,23 @@ function withTimeout(promise, ms) {
     timeoutId = setTimeout(() => reject(new Error('TIMEOUT')), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+// Null-safe DOM setters. If popup.html and popup.js ever get out of sync
+// (e.g. only one file gets updated during a manual install), these guard
+// against "Cannot set properties of null" crashing the entire render pass -
+// a single missing element degrades gracefully instead of aborting the scan.
+function setText(elem, text) {
+  if (elem) elem.textContent = text;
+  else console.warn('[AuditSnap] Expected DOM element not found - popup.html may be out of sync with popup.js.');
+}
+
+function clearEl(elem) {
+  if (elem) elem.innerHTML = '';
+}
+
+function appendChildSafe(parent, child) {
+  if (parent) parent.appendChild(child);
 }
 
 function isRestrictedUrl(url) {
@@ -383,22 +424,22 @@ async function inspectCookies(tab) {
 // STEP 4: PASSIVE ATTACK SURFACE (robots.txt / sitemap.xml / fingerprint headers)
 // ============================================================
 
-async function fetchTextWithTimeout(url) {
+async function fetchTextWithTimeout(url, options) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(url, Object.assign({
       method: 'GET',
       redirect: 'follow',
       credentials: 'omit',
       signal: controller.signal,
       cache: 'no-store',
-    });
+    }, options || {}));
     if (!res.ok) {
-      return { accessible: false, status: res.status };
+      return { accessible: false, status: res.status, finalUrl: res.url };
     }
     const text = await res.text();
-    return { accessible: true, status: res.status, text };
+    return { accessible: true, status: res.status, text, finalUrl: res.url };
   } catch (err) {
     const timedOut = err && err.name === 'AbortError';
     return { accessible: false, error: timedOut ? 'timeout' : String(err) };
@@ -562,7 +603,9 @@ function detectTechnologies(headers, cookies) {
 }
 
 // ============================================================
-// STEP 8: THIRD-PARTY SCRIPT INVENTORY (content-script injection)
+// STEP 8: PAGE RUNTIME INSPECTION (content-script injection)
+// Covers: third-party scripts, negotiated HTTP protocol, mixed content.
+// Bundled into a single injection to avoid multiple executeScript calls.
 // ============================================================
 
 function labelForScriptDomain(domain) {
@@ -571,13 +614,15 @@ function labelForScriptDomain(domain) {
   return match ? KNOWN_SCRIPT_DOMAINS[match] : null;
 }
 
-async function scanThirdPartyScripts(tab) {
+async function scanPageRuntime(tab) {
   try {
     const injectionResults = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
         try {
           const pageHost = location.hostname;
+
+          // --- third-party scripts ---
           const scripts = Array.from(document.scripts || []);
           const hostCounts = {};
           scripts.forEach((s) => {
@@ -591,24 +636,134 @@ async function scanThirdPartyScripts(tab) {
               // Ignore unparsable script src values.
             }
           });
-          return Object.entries(hostCounts).map(([domain, count]) => ({ domain, count }));
+          const thirdPartyScripts = Object.entries(hostCounts).map(([domain, count]) => ({ domain, count }));
+
+          // --- negotiated HTTP protocol (h2 / h3 / http/1.1) ---
+          let protocol = null;
+          try {
+            const navEntries = performance.getEntriesByType('navigation');
+            if (navEntries && navEntries[0]) protocol = navEntries[0].nextHopProtocol || null;
+          } catch (e) {
+            // Performance API unavailable in this context.
+          }
+
+          // --- mixed content: http:// resources loaded on an https:// page ---
+          let mixedContent = [];
+          try {
+            if (location.protocol === 'https:') {
+              const resources = performance.getEntriesByType('resource') || [];
+              const insecureUrls = new Set();
+              resources.forEach((r) => {
+                if (r.name && r.name.indexOf('http://') === 0) insecureUrls.add(r.name);
+              });
+              mixedContent = Array.from(insecureUrls).slice(0, 20);
+            }
+          } catch (e) {
+            // Performance API unavailable in this context.
+          }
+
+          return { thirdPartyScripts, protocol, mixedContent };
         } catch (e) {
-          return [];
+          return { thirdPartyScripts: [], protocol: null, mixedContent: [] };
         }
       },
     });
 
-    const result = injectionResults && injectionResults[0] ? injectionResults[0].result : [];
-    state.thirdPartyScripts = { checked: true, list: Array.isArray(result) ? result : [], error: null };
+    const result = injectionResults && injectionResults[0] ? injectionResults[0].result : null;
+    const safeResult = result || { thirdPartyScripts: [], protocol: null, mixedContent: [] };
+
+    state.thirdPartyScripts = { checked: true, list: Array.isArray(safeResult.thirdPartyScripts) ? safeResult.thirdPartyScripts : [], error: null };
+    state.protocolInfo = { checked: true, protocol: safeResult.protocol || null };
+    state.mixedContent = { checked: true, resources: Array.isArray(safeResult.mixedContent) ? safeResult.mixedContent : [] };
   } catch (err) {
     // Injection can fail on special pages (Web Store, PDF viewer, etc.)
     // even when the URL doesn't match our isRestrictedUrl() guard.
-    state.thirdPartyScripts = { checked: true, list: [], error: String(err && err.message ? err.message : err) };
+    const errMsg = String(err && err.message ? err.message : err);
+    state.thirdPartyScripts = { checked: true, list: [], error: errMsg };
+    state.protocolInfo = { checked: true, protocol: null, error: errMsg };
+    state.mixedContent = { checked: true, resources: [], error: errMsg };
   }
 }
 
 // ============================================================
-// STEP 9: SCORING
+// STEP 9: HTTPS ENFORCEMENT
+// Does the plain-http origin actually redirect to https?
+// ============================================================
+
+async function checkHttpsEnforcement(origin) {
+  if (!origin.startsWith('https:')) {
+    state.httpsEnforcement = { checked: true, enforced: false, finalUrl: null, note: 'The site itself is not served over HTTPS.' };
+    return;
+  }
+  try {
+    const httpOrigin = origin.replace(/^https:/, 'http:');
+    const result = await fetchTextWithTimeout(httpOrigin, { credentials: 'omit' });
+    if (result.finalUrl) {
+      state.httpsEnforcement = {
+        checked: true,
+        enforced: result.finalUrl.startsWith('https://'),
+        finalUrl: result.finalUrl,
+      };
+    } else {
+      // Could not resolve a final URL (e.g. plain HTTP port closed/timed out) -
+      // inconclusive rather than a hard fail, since many hosts simply don't
+      // listen on port 80 at all, which is itself not necessarily insecure.
+      state.httpsEnforcement = { checked: true, enforced: null, finalUrl: null, error: result.error || 'Could not reach the plain-HTTP origin.' };
+    }
+  } catch (err) {
+    state.httpsEnforcement = { checked: true, enforced: null, finalUrl: null, error: String(err) };
+  }
+}
+
+// ============================================================
+// STEP 10: EMAIL SECURITY (SPF / DMARC via DNS-over-HTTPS)
+// ============================================================
+
+async function fetchDnsTxt(name) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const url = `${DOH_ENDPOINT}?name=${encodeURIComponent(name)}&type=TXT`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/dns-json' },
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const answers = Array.isArray(data.Answer) ? data.Answer : [];
+    return answers.map((a) => (a.data || '').replace(/^"|"$/g, ''));
+  } catch (err) {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkEmailSecurity(hostname) {
+  try {
+    // Approximate the organizational domain by stripping a single leading
+    // "www." label. This covers the large majority of real-world sites
+    // without needing a full public-suffix-list lookup.
+    const rootGuess = hostname.replace(/^www\./i, '');
+
+    const [spfRecords, dmarcRecords] = await Promise.all([
+      fetchDnsTxt(rootGuess),
+      fetchDnsTxt(`_dmarc.${rootGuess}`),
+    ]);
+
+    const spf = spfRecords.find((r) => /v=spf1/i.test(r)) || null;
+    const dmarc = dmarcRecords.find((r) => /v=DMARC1/i.test(r)) || null;
+
+    state.emailSecurity = { checked: true, domain: rootGuess, spf, dmarc, error: null };
+  } catch (err) {
+    state.emailSecurity = { checked: true, domain: hostname, spf: null, dmarc: null, error: String(err) };
+  }
+}
+
+// ============================================================
+// STEP 11: SCORING
 // ============================================================
 
 function computeHeaderResults() {
@@ -638,11 +793,19 @@ function computeScore() {
   const cookiesScore = Math.max(0, COOKIE_MAX_POINTS - cookiePenalty);
 
   // Surface: disclosed sensitive robots.txt paths + fingerprinting headers
-  // + exposed sensitive files (weighted heavier - these are severe findings).
-  const surfacePenaltyRaw =
+  // + exposed sensitive files + HTTPS enforcement + mixed content.
+  let surfacePenaltyRaw =
     state.robots.sensitivePaths.length * 2 +
     state.fingerprint.length * 2 +
     state.sensitiveFiles.exposed.length * SENSITIVE_FILE_PENALTY_EACH;
+
+  if (state.httpsEnforcement.checked && state.httpsEnforcement.enforced === false) {
+    surfacePenaltyRaw += HTTPS_NOT_ENFORCED_PENALTY;
+  }
+  if (state.mixedContent.checked && state.mixedContent.resources.length > 0) {
+    surfacePenaltyRaw += MIXED_CONTENT_PENALTY;
+  }
+
   const surfacePenalty = Math.min(surfacePenaltyRaw, SURFACE_PENALTY_CAP);
   const surfaceScore = Math.max(0, SURFACE_MAX_POINTS - surfacePenalty);
 
@@ -658,36 +821,42 @@ function scoreLabelFor(score) {
 }
 
 // ============================================================
-// RENDERING
+// RENDERING (every setter is null-safe - see setText/clearEl/appendChildSafe)
 // ============================================================
 
 function renderTargetRow() {
+  let label;
   try {
     const u = new URL(state.tab.url);
-    el.targetDomain.textContent = u.hostname + (u.pathname !== '/' ? u.pathname : '');
+    label = u.hostname + (u.pathname !== '/' ? u.pathname : '');
   } catch (e) {
-    el.targetDomain.textContent = state.tab.url || 'Unknown target';
+    label = state.tab.url || 'Unknown target';
   }
+  setText(el.targetDomain, label);
 }
 
 function renderScore() {
   const score = state.score;
   const { text, color } = scoreLabelFor(score);
 
-  el.scoreValue.textContent = String(score);
-  el.scoreLabel.textContent = text;
-  el.scoreLabel.style.color = color;
+  setText(el.scoreValue, String(score));
+  setText(el.scoreLabel, text);
+  if (el.scoreLabel) el.scoreLabel.style.color = color;
 
   const circumference = 264; // 2 * PI * r(42) ≈ 263.9
   const offset = circumference - (score / 100) * circumference;
-  el.scoreRingFg.style.strokeDashoffset = String(offset);
-  el.scoreRingFg.style.stroke = color;
+  if (el.scoreRingFg) {
+    el.scoreRingFg.style.strokeDashoffset = String(offset);
+    el.scoreRingFg.style.stroke = color;
+  }
 
-  el.targetDot.className = 'dot ' + (score >= 85 ? 'ok' : score >= 60 ? 'warn' : 'error');
+  if (el.targetDot) {
+    el.targetDot.className = 'dot ' + (score >= 85 ? 'ok' : score >= 60 ? 'warn' : 'error');
+  }
 }
 
 function renderHeaders() {
-  el.headersList.innerHTML = '';
+  clearEl(el.headersList);
 
   if (state.headersSource === 'unavailable') {
     const li = document.createElement('li');
@@ -699,7 +868,7 @@ function renderHeaders() {
       </div>
       <div class="check-desc">Could not retrieve response headers for this page (network restriction, CORS, or the page has not fully loaded yet). Try the re-scan button.</div>
     `;
-    el.headersList.appendChild(li);
+    appendChildSafe(el.headersList, li);
     return;
   }
 
@@ -714,20 +883,20 @@ function renderHeaders() {
       <div class="check-desc">${escapeHtml(h.risk)}</div>
       ${h.present ? `<div class="check-value">${escapeHtml(h.value).slice(0, 140)}</div>` : ''}
     `;
-    el.headersList.appendChild(li);
+    appendChildSafe(el.headersList, li);
   }
 }
 
 function renderCookies() {
-  el.cookieTotal.textContent = String(state.cookieSummary.total);
-  el.cookieInsecure.textContent = String(state.cookieSummary.insecure);
-  el.cookiesList.innerHTML = '';
+  setText(el.cookieTotal, String(state.cookieSummary.total));
+  setText(el.cookieInsecure, String(state.cookieSummary.insecure));
+  clearEl(el.cookiesList);
 
   if (!state.cookies.length) {
     const li = document.createElement('li');
     li.className = 'check-item';
     li.innerHTML = `<div class="check-desc">No cookies were found for this origin.</div>`;
-    el.cookiesList.appendChild(li);
+    appendChildSafe(el.cookiesList, li);
     return;
   }
 
@@ -746,48 +915,48 @@ function renderCookies() {
       </div>
       <div class="check-value">${escapeHtml(flagsText)}</div>
     `;
-    el.cookiesList.appendChild(li);
+    appendChildSafe(el.cookiesList, li);
   });
 
   if (sorted.length > MAX_SHOWN) {
     const li = document.createElement('li');
     li.className = 'check-item';
     li.innerHTML = `<div class="check-desc">+ ${sorted.length - MAX_SHOWN} more cookie(s) not shown.</div>`;
-    el.cookiesList.appendChild(li);
+    appendChildSafe(el.cookiesList, li);
   }
 }
 
 function renderSurface() {
   // robots.txt
   if (!state.robots.checked) {
-    el.robotsStatus.textContent = 'Checking…';
+    setText(el.robotsStatus, 'Checking…');
   } else if (!state.robots.accessible) {
-    el.robotsStatus.textContent = `Not accessible (${state.robots.error || 'no robots.txt found'}).`;
+    setText(el.robotsStatus, `Not accessible (${state.robots.error || 'no robots.txt found'}).`);
   } else if (state.robots.sensitivePaths.length === 0) {
-    el.robotsStatus.textContent = 'Accessible — no high-interest disallowed paths detected.';
+    setText(el.robotsStatus, 'Accessible — no high-interest disallowed paths detected.');
   } else {
-    el.robotsStatus.textContent = `Accessible — ${state.robots.sensitivePaths.length} high-interest path(s) disclosed:`;
+    setText(el.robotsStatus, `Accessible — ${state.robots.sensitivePaths.length} high-interest path(s) disclosed:`);
   }
 
-  el.robotsList.innerHTML = '';
+  clearEl(el.robotsList);
   state.robots.sensitivePaths.forEach((p) => {
     const li = document.createElement('li');
     li.className = 'chip';
     li.textContent = p;
-    el.robotsList.appendChild(li);
+    appendChildSafe(el.robotsList, li);
   });
 
   // sitemap.xml
   if (!state.sitemap.checked) {
-    el.sitemapStatus.textContent = 'Checking…';
+    setText(el.sitemapStatus, 'Checking…');
   } else if (state.sitemap.accessible) {
-    el.sitemapStatus.textContent = 'sitemap.xml is publicly accessible.';
+    setText(el.sitemapStatus, 'sitemap.xml is publicly accessible.');
   } else {
-    el.sitemapStatus.textContent = `sitemap.xml not found or inaccessible (${state.sitemap.error || 'n/a'}).`;
+    setText(el.sitemapStatus, `sitemap.xml not found or inaccessible (${state.sitemap.error || 'n/a'}).`);
   }
 
   // fingerprinting
-  el.fingerprintList.innerHTML = '';
+  clearEl(el.fingerprintList);
   if (!state.fingerprint.length) {
     const li = document.createElement('li');
     li.className = 'check-item pass';
@@ -797,7 +966,7 @@ function renderSurface() {
         <span class="badge pass">Pass</span>
       </div>
     `;
-    el.fingerprintList.appendChild(li);
+    appendChildSafe(el.fingerprintList, li);
   } else {
     state.fingerprint.forEach((f) => {
       const li = document.createElement('li');
@@ -809,69 +978,72 @@ function renderSurface() {
         </div>
         <div class="check-value">${escapeHtml(f.value).slice(0, 140)}</div>
       `;
-      el.fingerprintList.appendChild(li);
+      appendChildSafe(el.fingerprintList, li);
     });
   }
 
   // sensitive files
   if (!state.sensitiveFiles.checked) {
-    el.sensitiveFilesStatus.textContent = 'Checking…';
+    setText(el.sensitiveFilesStatus, 'Checking…');
   } else if (state.sensitiveFiles.exposed.length === 0) {
-    el.sensitiveFilesStatus.textContent = 'No exposed source/config files detected among common paths.';
+    setText(el.sensitiveFilesStatus, 'No exposed source/config files detected among common paths.');
   } else {
-    el.sensitiveFilesStatus.textContent = `⚠ ${state.sensitiveFiles.exposed.length} sensitive file(s) publicly accessible:`;
+    setText(el.sensitiveFilesStatus, `⚠ ${state.sensitiveFiles.exposed.length} sensitive file(s) publicly accessible:`);
   }
-  el.sensitiveFilesList.innerHTML = '';
+  clearEl(el.sensitiveFilesList);
   state.sensitiveFiles.exposed.forEach((f) => {
     const li = document.createElement('li');
     li.className = 'chip';
     li.textContent = `${f.path} (HTTP ${f.status})`;
-    el.sensitiveFilesList.appendChild(li);
+    appendChildSafe(el.sensitiveFilesList, li);
   });
 
   // security.txt
   if (!state.securityTxt.checked) {
-    el.securityTxtStatus.textContent = 'Checking…';
+    setText(el.securityTxtStatus, 'Checking…');
   } else if (state.securityTxt.accessible) {
-    el.securityTxtStatus.textContent = state.securityTxt.contact
-      ? `Present at ${state.securityTxt.path} — contact: ${state.securityTxt.contact}`
-      : `Present at ${state.securityTxt.path}, but no Contact: line found.`;
+    setText(
+      el.securityTxtStatus,
+      state.securityTxt.contact
+        ? `Present at ${state.securityTxt.path} — contact: ${state.securityTxt.contact}`
+        : `Present at ${state.securityTxt.path}, but no Contact: line found.`
+    );
   } else {
-    el.securityTxtStatus.textContent = 'Not found — this organization has no published responsible disclosure contact.';
+    setText(el.securityTxtStatus, 'Not found — this organization has no published responsible disclosure contact.');
   }
 }
 
 function renderTechStack() {
   // Detected technologies
-  el.techList.innerHTML = '';
+  clearEl(el.techList);
   if (!state.techStack.length) {
-    el.techStatus.textContent = 'No recognizable technology signatures found in headers or cookies.';
+    setText(el.techStatus, 'No recognizable technology signatures found in headers or cookies.');
   } else {
-    el.techStatus.textContent = `${state.techStack.length} technology signature(s) detected:`;
+    setText(el.techStatus, `${state.techStack.length} technology signature(s) detected:`);
     state.techStack.forEach((label) => {
       const li = document.createElement('li');
       li.className = 'chip tech';
       li.textContent = label;
-      el.techList.appendChild(li);
+      appendChildSafe(el.techList, li);
     });
   }
 
   // Third-party scripts
-  el.thirdPartyList.innerHTML = '';
+  clearEl(el.thirdPartyList);
   if (!state.thirdPartyScripts.checked) {
-    el.thirdPartyStatus.textContent = 'Scanning page…';
+    setText(el.thirdPartyStatus, 'Scanning page…');
     return;
   }
   if (state.thirdPartyScripts.error) {
-    el.thirdPartyStatus.textContent = 'Could not inspect scripts on this page (restricted context).';
+    setText(el.thirdPartyStatus, 'Could not inspect scripts on this page (restricted context).');
     return;
   }
   const list = state.thirdPartyScripts.list;
   if (!list.length) {
-    el.thirdPartyStatus.textContent = 'No external script hosts detected on this page.';
+    setText(el.thirdPartyStatus, 'No external script hosts detected on this page.');
     return;
   }
-  el.thirdPartyStatus.textContent = `${list.length} external script host(s) loaded on this page:`;
+  setText(el.thirdPartyStatus, `${list.length} external script host(s) loaded on this page:`);
   const sorted = [...list].sort((a, b) => b.count - a.count);
   sorted.forEach((entry) => {
     const label = labelForScriptDomain(entry.domain);
@@ -884,17 +1056,98 @@ function renderTechStack() {
       </div>
       <div class="check-value">${entry.count} script tag(s)</div>
     `;
-    el.thirdPartyList.appendChild(li);
+    appendChildSafe(el.thirdPartyList, li);
   });
 }
 
+function renderNetwork() {
+  // HTTPS enforcement
+  if (!state.httpsEnforcement.checked) {
+    setText(el.httpsEnforcementStatus, 'Checking…');
+  } else if (state.httpsEnforcement.enforced === true) {
+    setText(el.httpsEnforcementStatus, `✅ Plain-HTTP requests are redirected to HTTPS (final URL: ${state.httpsEnforcement.finalUrl}).`);
+  } else if (state.httpsEnforcement.enforced === false) {
+    setText(el.httpsEnforcementStatus, `❌ ${state.httpsEnforcement.note || 'The plain-HTTP origin does not redirect to HTTPS.'} Users typing "http://" or clicking old links may stay unencrypted.`);
+  } else {
+    setText(el.httpsEnforcementStatus, `Inconclusive — could not verify (${state.httpsEnforcement.error || 'network restriction'}).`);
+  }
+
+  // Protocol
+  if (!state.protocolInfo.checked) {
+    setText(el.protocolStatus, 'Checking…');
+  } else if (state.protocolInfo.protocol) {
+    setText(el.protocolStatus, `Negotiated protocol: ${state.protocolInfo.protocol.toUpperCase()}`);
+  } else {
+    setText(el.protocolStatus, 'Could not determine the negotiated protocol on this page.');
+  }
+
+  // Mixed content
+  clearEl(el.mixedContentList);
+  if (!state.mixedContent.checked) {
+    setText(el.mixedContentStatus, 'Checking…');
+  } else if (state.mixedContent.resources.length === 0) {
+    setText(el.mixedContentStatus, 'No insecure (http://) resources detected on this HTTPS page.');
+  } else {
+    setText(el.mixedContentStatus, `⚠ ${state.mixedContent.resources.length} insecure resource(s) loaded over plain HTTP:`);
+    state.mixedContent.resources.slice(0, 8).forEach((url) => {
+      const li = document.createElement('li');
+      li.className = 'chip';
+      li.textContent = url.length > 60 ? url.slice(0, 57) + '…' : url;
+      appendChildSafe(el.mixedContentList, li);
+    });
+  }
+
+  // Email security (SPF / DMARC)
+  clearEl(el.emailSecurityList);
+  if (!state.emailSecurity.checked) {
+    setText(el.emailSecurityStatus, 'Looking up DNS records…');
+  } else {
+    setText(el.emailSecurityStatus, `DNS TXT records checked for ${state.emailSecurity.domain}:`);
+
+    const spfLi = document.createElement('li');
+    spfLi.className = 'check-item ' + (state.emailSecurity.spf ? 'pass' : 'warn');
+    spfLi.innerHTML = `
+      <div class="check-item-top">
+        <span class="check-name">SPF Record</span>
+        <span class="badge ${state.emailSecurity.spf ? 'pass' : 'warn'}">${state.emailSecurity.spf ? 'Found' : 'Missing'}</span>
+      </div>
+      ${state.emailSecurity.spf ? `<div class="check-value">${escapeHtml(state.emailSecurity.spf).slice(0, 140)}</div>` : `<div class="check-desc">No SPF record means anyone can send email that appears to come from this domain, aiding phishing.</div>`}
+    `;
+    appendChildSafe(el.emailSecurityList, spfLi);
+
+    const dmarcLi = document.createElement('li');
+    dmarcLi.className = 'check-item ' + (state.emailSecurity.dmarc ? 'pass' : 'warn');
+    dmarcLi.innerHTML = `
+      <div class="check-item-top">
+        <span class="check-name">DMARC Record</span>
+        <span class="badge ${state.emailSecurity.dmarc ? 'pass' : 'warn'}">${state.emailSecurity.dmarc ? 'Found' : 'Missing'}</span>
+      </div>
+      ${state.emailSecurity.dmarc ? `<div class="check-value">${escapeHtml(state.emailSecurity.dmarc).slice(0, 140)}</div>` : `<div class="check-desc">No DMARC policy means spoofed emails from this domain aren't flagged or rejected by receiving mail servers.</div>`}
+    `;
+    appendChildSafe(el.emailSecurityList, dmarcLi);
+  }
+}
+
 function renderAll() {
-  renderTargetRow();
-  renderScore();
-  renderHeaders();
-  renderCookies();
-  renderSurface();
-  renderTechStack();
+  // Each section renders independently - a DOM mismatch or unexpected
+  // state shape in one panel must never prevent the others from showing
+  // the data that scanned successfully.
+  const sections = [
+    ['target row', renderTargetRow],
+    ['score', renderScore],
+    ['headers', renderHeaders],
+    ['cookies', renderCookies],
+    ['surface', renderSurface],
+    ['tech stack', renderTechStack],
+    ['network', renderNetwork],
+  ];
+  sections.forEach(([name, fn]) => {
+    try {
+      fn();
+    } catch (err) {
+      console.error(`[AuditSnap] Render section "${name}" failed:`, err);
+    }
+  });
 }
 
 // ============================================================
@@ -908,7 +1161,7 @@ function setupTabs() {
         b.classList.remove('active');
         b.setAttribute('aria-selected', 'false');
       });
-      Object.values(el.panels).forEach((p) => p.classList.remove('active'));
+      Object.values(el.panels).forEach((p) => p && p.classList.remove('active'));
 
       btn.classList.add('active');
       btn.setAttribute('aria-selected', 'true');
@@ -949,6 +1202,18 @@ function buildProposalHook() {
   if (state.fingerprint.length > 0) {
     issues.push(`server fingerprinting headers exposing backend technology`);
   }
+  if (state.httpsEnforcement.checked && state.httpsEnforcement.enforced === false) {
+    issues.push(`plain-HTTP requests are not redirected to HTTPS`);
+  }
+  if (state.mixedContent.checked && state.mixedContent.resources.length > 0) {
+    issues.push(`${state.mixedContent.resources.length} resource(s) loaded over insecure HTTP on an HTTPS page (mixed content)`);
+  }
+  if (state.emailSecurity.checked && !state.emailSecurity.spf) {
+    issues.push(`no SPF record — the domain is more vulnerable to email spoofing/phishing`);
+  }
+  if (state.emailSecurity.checked && !state.emailSecurity.dmarc) {
+    issues.push(`no DMARC policy — spoofed emails from this domain won't be flagged or rejected`);
+  }
   if (!state.securityTxt.accessible) {
     issues.push(`no published security.txt / responsible disclosure contact`);
   }
@@ -985,7 +1250,7 @@ function buildMarkdownReport() {
   lines.push(`**Tool:** AuditSnap (Passive Scan)  `);
   lines.push(`**Security Posture Score:** ${state.score} / 100`);
   lines.push(``);
-  lines.push(`> This is a *passive* assessment based on publicly observable HTTP responses, cookies, and disclosure files. It is not a substitute for a full penetration test.`);
+  lines.push(`> This is a *passive* assessment based on publicly observable HTTP responses, cookies, DNS records, and disclosure files. It is not a substitute for a full penetration test.`);
   lines.push(``);
 
   lines.push(`## 1. HTTP Security Headers`);
@@ -1060,18 +1325,46 @@ function buildMarkdownReport() {
   }
   lines.push(``);
 
+  lines.push(`## 6. Network & Transport`);
+  lines.push(``);
+  if (state.httpsEnforcement.checked) {
+    if (state.httpsEnforcement.enforced === true) {
+      lines.push(`**HTTPS Enforcement:** ✅ Plain-HTTP requests redirect to HTTPS (\`${state.httpsEnforcement.finalUrl}\`).`);
+    } else if (state.httpsEnforcement.enforced === false) {
+      lines.push(`**HTTPS Enforcement:** ❌ ${state.httpsEnforcement.note || 'Plain-HTTP requests are not redirected to HTTPS.'}`);
+    } else {
+      lines.push(`**HTTPS Enforcement:** Inconclusive (${state.httpsEnforcement.error || 'network restriction'}).`);
+    }
+  }
+  lines.push(`**Negotiated Protocol:** ${state.protocolInfo.protocol ? state.protocolInfo.protocol.toUpperCase() : 'Unknown'}`);
+  lines.push(`**Mixed Content:** ${state.mixedContent.resources.length ? `⚠ ${state.mixedContent.resources.length} insecure resource(s) detected` : 'None detected'}`);
+  if (state.mixedContent.resources.length) {
+    state.mixedContent.resources.slice(0, 10).forEach((url) => lines.push(`- \`${url}\``));
+  }
+  lines.push(``);
+
+  lines.push(`## 7. Email Security (SPF / DMARC)`);
+  lines.push(``);
+  if (state.emailSecurity.checked) {
+    lines.push(`Domain checked: \`${state.emailSecurity.domain}\``);
+    lines.push(``);
+    lines.push(`- **SPF:** ${state.emailSecurity.spf ? `\`${state.emailSecurity.spf}\`` : '❌ Not found — domain is more vulnerable to email spoofing.'}`);
+    lines.push(`- **DMARC:** ${state.emailSecurity.dmarc ? `\`${state.emailSecurity.dmarc}\`` : '❌ Not found — spoofed emails from this domain will not be flagged or rejected.'}`);
+  } else {
+    lines.push(`Not checked.`);
+  }
+  lines.push(``);
+
   lines.push(`## Summary`);
   lines.push(``);
-  lines.push(`This passive scan surfaced ${getFailedHeaderLabels().length} missing security header(s), ${state.cookieSummary.insecure} insecure cookie(s), ${state.robots.sensitivePaths.length} disclosed sensitive path(s), and ${state.sensitiveFiles.exposed.length} exposed sensitive file(s), resulting in an overall Security Posture Score of **${state.score}/100**.`);
+  lines.push(`This passive scan surfaced ${getFailedHeaderLabels().length} missing security header(s), ${state.cookieSummary.insecure} insecure cookie(s), ${state.robots.sensitivePaths.length} disclosed sensitive path(s), ${state.sensitiveFiles.exposed.length} exposed sensitive file(s), and ${state.mixedContent.resources.length} mixed-content resource(s), resulting in an overall Security Posture Score of **${state.score}/100**.`);
   lines.push(``);
   lines.push(`_Generated with AuditSnap._`);
 
   return lines.join('\n');
 }
 
-// ============================================================
 // CLIPBOARD
-// ============================================================
 
 async function copyToClipboard(text, successMessage) {
   try {
@@ -1101,9 +1394,7 @@ async function copyToClipboard(text, successMessage) {
   }
 }
 
-// ============================================================
 // MAIN ORCHESTRATION
-// ============================================================
 
 function setLoading(isLoading) {
   el.loadingState.classList.toggle('hidden', !isLoading);
@@ -1139,8 +1430,11 @@ async function runAudit() {
     }
 
     let originUrl;
+    let hostname;
     try {
-      originUrl = new URL(tab.url).origin;
+      const parsed = new URL(tab.url);
+      originUrl = parsed.origin;
+      hostname = parsed.hostname;
     } catch (e) {
       throw new Error('Could not parse the active tab URL.');
     }
@@ -1158,7 +1452,9 @@ async function runAudit() {
       scanAttackSurface(originUrl),
       scanSensitiveFiles(originUrl),
       scanSecurityTxt(originUrl),
-      scanThirdPartyScripts(tab),
+      scanPageRuntime(tab),
+      checkHttpsEnforcement(originUrl),
+      checkEmailSecurity(hostname),
     ]);
 
     state.techStack = detectTechnologies(state.headers, state.cookies);
@@ -1183,9 +1479,7 @@ async function runAudit() {
   }
 }
 
-// ============================================================
 // EVENT WIRING
-// ============================================================
 
 function wireEvents() {
   el.rescanBtn.addEventListener('click', () => {
@@ -1205,9 +1499,7 @@ function wireEvents() {
   });
 }
 
-// ============================================================
 // INIT
-// ============================================================
 
 document.addEventListener('DOMContentLoaded', () => {
   setupTabs();
